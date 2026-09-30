@@ -26,13 +26,14 @@ This tool detects polymorphic malware by targeting the **three things it cannot 
 
 ## Key Features
 
-- **Zero External Dependencies**: Built entirely using Python standard libraries (`struct`, `math`, `os`, `sys`). Runs instantly on any system with Python 3.10+ installed.
+- **Zero External Dependencies & Single-Pass I/O**: Built entirely using Python standard libraries (`struct`, `math`, `os`, `sys`). Runs instantly without external binaries, parsing binary buffers directly in memory.
 - **Pure-Python PE Parser**: Low-level parsing of Windows Portable Executable headers (DOS stub, PE offset `0x3C`, COFF, Optional Header, Section Tables, Entry Points).
-- **256-Byte Sliding-Window Entropy Engine**: Defeats **entropy dilution / zero-padding attacks** by detecting local pockets of high entropy even if overall file entropy is lowered.
+- **256-Byte Sliding-Window Entropy Engine**: Calibrated for finite-sample statistics ($N=256$, expected uniform mean $\approx 7.28$), detecting localized encrypted pockets even under heavy zero-padding dilution attacks.
 - **$W \oplus X$ Permission Inspector**: Identifies dangerous memory sections with both `IMAGE_SCN_MEM_WRITE` (`0x80000000`) and `IMAGE_SCN_MEM_EXECUTE` (`0x20000000`).
-- **Opcode Heuristic Engine**: Disassembles entry-point opcodes to flag backward loops (`LOOP 0xE2`, `JNZ 0x75`, `JMP 0xEB`) performing math modifications on memory.
+- **x86 Opcode & Group 1 Arithmetic Heuristics**: Decodes primary XOR opcodes (`0x30..0x35`) as well as Group 1 immediate arithmetic (`0x80`, `0x82`, `0x83` with ModR/M ADD/SUB/XOR extensions) enclosed in backward relative branches (`LOOP 0xE2`, `JNZ 0x75`, `JMP 0xEB`).
+- **Padding-Bypass Stub Detection**: Inspects entry point instructions as well as byte boundaries immediately preceding high-entropy payloads to catch stubs buried after zeroes.
 - **Explainable Multi-Factor Scoring (0–100)**: Combines all signals into a transparent, weighted risk score with clear verdicts (`CLEAN`, `SUSPICIOUS`, `HIGH RISK`).
-- **Built-in Safe Test Harness (`--demo`)**: Generates safe clean and simulated polymorphic samples on-the-fly for immediate testing and presentation demos.
+- **Built-in Safe Test Harness (`--demo`)**: Generates safe clean, polymorphic, and diluted zero-padded samples on-the-fly for immediate testing and presentation demos.
 
 ---
 
