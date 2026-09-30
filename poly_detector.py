@@ -134,19 +134,21 @@ def parse_pe_sections(data: bytes):
 
 def detect_decryption_loop(code_bytes: bytes) -> tuple[bool, str]:
     """
-    Scans code bytes for decryptor loop signatures by verifying that backward relative branches
-    specifically enclose arithmetic/XOR instructions within their loop body:
-    1. Primary ADD (0x00..0x05), SUB (0x28..0x2D), XOR (0x30..0x35)
-    2. Group 1 immediate arithmetic (0x80, 0x82, 0x83) with ADD(0), SUB(5), or XOR(6) ModR/M reg field
-    3. Backward relative jumps/loops (0xEB, 0x75, 0x74, 0xE2)
+    Heuristically scans code bytes for backward loops enclosing in-memory arithmetic:
+    1. In-memory primary XOR (0x30: xor r/m8, r8; 0x31: xor r/m32, r32) with mod != 3.
+       (0x32-0x35 are omitted as they target registers; plain ADD/SUB 0x00-0x05 are omitted
+       because 0x00 0x00 ('add [eax], al') causes false positives on zero padding).
+    2. Group 1 immediate arithmetic (0x80, 0x82, 0x83) with ADD(0), SUB(5), or XOR(6)
+       extensions targeting memory (mod != 3).
+    3. Backward relative jumps/loops (0xEB, 0x75, 0x74, 0xE2) whose displacement specifically
+       encloses at least one of the above memory arithmetic instructions.
     """
     if not code_bytes:
         return False, "No code bytes to inspect"
 
-    math_locations = set()
-    details = []
+    math_map = {}  # offset -> description
 
-    # Identify all arithmetic/crypto instruction offsets
+    # Identify all in-memory arithmetic/crypto instruction offsets
     i = 0
     while i < len(code_bytes):
         b = code_bytes[i]
@@ -155,9 +157,8 @@ def detect_decryption_loop(code_bytes: bytes) -> tuple[bool, str]:
         if b in (0x30, 0x31) and (i + 1) < len(code_bytes):
             modrm = code_bytes[i + 1]
             mod = (modrm >> 6) & 3
-            if mod != 3:  # mod == 3 is register-to-register (e.g. xor eax, eax), mod != 3 is memory
-                math_locations.add(i)
-                details.append(f"Primary XOR memory opcode 0x{b:02X} at +{i}")
+            if mod != 3:  # mod == 3 is register-to-register (e.g. xor eax, eax); mod != 3 is memory
+                math_map[i] = f"Primary XOR memory opcode 0x{b:02X}"
 
         # 2. Group 1 immediate arithmetic opcodes (0x80, 0x82, 0x83) targeting memory
         elif b in (0x80, 0x82, 0x83) and (i + 1) < len(code_bytes):
@@ -167,8 +168,8 @@ def detect_decryption_loop(code_bytes: bytes) -> tuple[bool, str]:
             # In polymorphic decryptors, payload modification writes to memory (mod != 3)
             # 0=ADD, 5=SUB, 6=XOR. (mod == 3 is pure register math like 'sub esp, 28h')
             if mod != 3 and reg_op in (0, 5, 6):
-                math_locations.add(i)
-                details.append(f"Group 1 memory arithmetic opcode 0x{b:02X} at +{i} (op={reg_op})")
+                op_names = {0: "ADD", 5: "SUB", 6: "XOR"}
+                math_map[i] = f"Group 1 {op_names[reg_op]} opcode 0x{b:02X}"
         i += 1
 
     # Check for backward branches and strictly verify if math is enclosed within the loop body
@@ -181,12 +182,13 @@ def detect_decryption_loop(code_bytes: bytes) -> tuple[bool, str]:
                 loop_start = max(0, (i + 2) - loop_len)
                 loop_end = i
                 # Enclosed math verification: math instruction must reside inside [loop_start, loop_end]
-                enclosed = [m for m in math_locations if loop_start <= m <= loop_end]
+                enclosed = [m for m in math_map if loop_start <= m <= loop_end]
                 if enclosed:
-                    details.append(f"Backward loop (opcode 0x{b:02X}, offset {offset}) encloses math at +{enclosed[0]}")
-                    return True, f"Detected backward loop containing XOR/arithmetic operations [{'; '.join(details)}]"
+                    enclosed_desc = [f"{math_map[m]} at +{m}" for m in enclosed]
+                    loop_str = f"Backward loop (opcode 0x{b:02X}, offset {offset}) encloses [{'; '.join(enclosed_desc)}]"
+                    return True, f"Detected backward loop containing XOR/arithmetic operations [{loop_str}]"
 
-    if math_locations:
+    if math_map:
         return False, "Arithmetic/XOR operations found, but no enclosing loop detected"
 
     return False, "No decryptor loop patterns identified"
@@ -254,8 +256,8 @@ def scan_file(file_path: str):
     print(f"\n[2] DECRYPTOR STUB ANALYSIS")
     has_loop, loop_desc = detect_decryption_loop(ep_bytes)
 
-    # Padding-bypass check: For raw non-PE binaries, if no loop at file head,
-    # inspect the boundary immediately preceding the first high-entropy window
+    # Heuristic transition search: For raw non-PE binaries, inspects 64 bytes before the first high-entropy window.
+    # Note: If an attacker inserts >64 bytes of junk code between stub and payload, this heuristic will miss the stub.
     if not is_pe and not has_loop and first_high_offset > 0:
         check_start = max(0, first_high_offset - 64)
         check_chunk = file_bytes[check_start : check_start + 256]
