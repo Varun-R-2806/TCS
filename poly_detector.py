@@ -4,7 +4,7 @@ Simple Polymorphic Virus Detector
 ----------------------------------
 A lightweight, zero-dependency tool to detect polymorphic malware characteristics:
 1. High Shannon Entropy (encrypted/scrambled payload with 256-byte sliding window)
-2. Decryptor Stub Heuristics (loops with XOR/ADD/SUB operations, Group 1 opcodes)
+2. Decryptor Stub Heuristics (loops enclosing XOR/ADD/SUB operations, Group 1 opcodes)
 3. Abnormal PE Section Permissions (Writable + Executable memory)
 """
 
@@ -34,29 +34,30 @@ def calculate_entropy(data: bytes) -> float:
     return round(entropy, 2)
 
 
-def calculate_sliding_window_entropy(data: bytes, window_size: int = 256, step: int = 64) -> tuple[float, int]:
+def calculate_sliding_window_entropy(data: bytes, window_size: int = 256, step: int = 64) -> tuple[float, int, int]:
     """
-    Slides a 256-byte window across the file to detect local pockets of encrypted code,
-    defeating entropy dilution/padding evasion techniques.
+    Slides a 256-byte window across the file to detect local pockets of encrypted code.
+    Returns: (peak_entropy, peak_offset, first_high_entropy_offset)
     Note: For N=256 uniform random bytes, expected entropy is ~7.28 bits/byte.
-    Returns: (peak_entropy, offset_of_peak)
     """
     if len(data) < window_size:
-        return calculate_entropy(data), 0
+        ent = calculate_entropy(data)
+        return ent, 0, (0 if ent >= 7.0 else -1)
 
     max_entropy = 0.0
     max_offset = 0
+    first_high_offset = -1
 
     for offset in range(0, len(data) - window_size + 1, step):
         chunk = data[offset : offset + window_size]
         ent = calculate_entropy(chunk)
+        if ent >= 7.0 and first_high_offset == -1:
+            first_high_offset = offset
         if ent > max_entropy:
             max_entropy = ent
             max_offset = offset
-            if max_entropy >= 7.70:
-                break
 
-    return round(max_entropy, 2), max_offset
+    return round(max_entropy, 2), max_offset, first_high_offset
 
 
 def parse_pe_sections(data: bytes):
@@ -89,7 +90,7 @@ def parse_pe_sections(data: bytes):
         # Section Headers start right after Optional Header
         section_offset = opt_header_offset + opt_header_size
 
-        for i in range(num_sections):
+        for _ in range(num_sections):
             hdr = data[section_offset : section_offset + 40]
             if len(hdr) < 40:
                 break
@@ -105,11 +106,11 @@ def parse_pe_sections(data: bytes):
             is_exec = bool(characteristics & 0x20000000)
             is_write = bool(characteristics & 0x80000000)
 
-            # Check if entry point falls into this section
+            # Check if entry point falls into this section (use consistent 256-byte slice)
             if virt_addr <= entry_point_rva < (virt_addr + virt_size):
                 ep_offset_in_sec = entry_point_rva - virt_addr
                 file_ep = raw_ptr + ep_offset_in_sec
-                entry_point_bytes = data[file_ep : file_ep + 128]
+                entry_point_bytes = data[file_ep : file_ep + 256]
 
             sections.append({
                 "name": name,
@@ -125,7 +126,7 @@ def parse_pe_sections(data: bytes):
     except (struct.error, IndexError):
         pass
 
-    if not entry_point_bytes and len(data) >= 128:
+    if not entry_point_bytes and len(data) >= 256:
         entry_point_bytes = data[:256]
 
     return is_pe, sections, entry_point_bytes
@@ -133,48 +134,60 @@ def parse_pe_sections(data: bytes):
 
 def detect_decryption_loop(code_bytes: bytes) -> tuple[bool, str]:
     """
-    Scans code bytes for x86/x64 decryptor loop signatures:
-    1. Primary XOR opcodes (0x30..0x35)
+    Scans code bytes for decryptor loop signatures by verifying that backward relative branches
+    specifically enclose arithmetic/XOR instructions within their loop body:
+    1. Primary ADD (0x00..0x05), SUB (0x28..0x2D), XOR (0x30..0x35)
     2. Group 1 immediate arithmetic (0x80, 0x82, 0x83) with ADD(0), SUB(5), or XOR(6) ModR/M reg field
-    3. Backward jumps/loops (0xEB, 0x75, 0x74, 0xE2 with negative offset)
+    3. Backward relative jumps/loops (0xEB, 0x75, 0x74, 0xE2)
     """
     if not code_bytes:
         return False, "No code bytes to inspect"
 
-    has_xor_or_math = False
-    has_backward_jump = False
+    math_locations = set()
     details = []
 
-    for i in range(len(code_bytes) - 1):
+    # Identify all arithmetic/crypto instruction offsets
+    i = 0
+    while i < len(code_bytes):
         b = code_bytes[i]
 
-        # 1. Primary XOR opcodes (0x30 - 0x35)
-        if 0x30 <= b <= 0x35:
-            has_xor_or_math = True
+        # 1. Primary XOR with memory destination (0x30: xor r/m8, r8; 0x31: xor r/m32, r32)
+        if b in (0x30, 0x31) and (i + 1) < len(code_bytes):
+            modrm = code_bytes[i + 1]
+            mod = (modrm >> 6) & 3
+            if mod != 3:  # mod == 3 is register-to-register (e.g. xor eax, eax), mod != 3 is memory
+                math_locations.add(i)
+                details.append(f"Primary XOR memory opcode 0x{b:02X} at +{i}")
 
-        # 2. Group 1 immediate arithmetic opcodes (0x80, 0x82, 0x83)
+        # 2. Group 1 immediate arithmetic opcodes (0x80, 0x82, 0x83) targeting memory
         elif b in (0x80, 0x82, 0x83) and (i + 1) < len(code_bytes):
             modrm = code_bytes[i + 1]
+            mod = (modrm >> 6) & 3
             reg_op = (modrm >> 3) & 7
-            # In x86 Group 1: 0 = ADD, 5 = SUB, 6 = XOR
-            if reg_op in (0, 5, 6):
-                has_xor_or_math = True
-                details.append(f"Group 1 arithmetic opcode 0x{b:02X} (op={reg_op})")
+            # In polymorphic decryptors, payload modification writes to memory (mod != 3)
+            # 0=ADD, 5=SUB, 6=XOR. (mod == 3 is pure register math like 'sub esp, 28h')
+            if mod != 3 and reg_op in (0, 5, 6):
+                math_locations.add(i)
+                details.append(f"Group 1 memory arithmetic opcode 0x{b:02X} at +{i} (op={reg_op})")
+        i += 1
 
-        # 3. Check for short backward jump: Opcode + negative signed 8-bit offset
+    # Check for backward branches and strictly verify if math is enclosed within the loop body
+    for i in range(len(code_bytes) - 1):
+        b = code_bytes[i]
         if b in (0xEB, 0x75, 0x74, 0xE2):
             offset = struct.unpack("b", bytes([code_bytes[i + 1]]))[0]
             if offset < 0 and abs(offset) < 60:
-                has_backward_jump = True
-                details.append(f"Backward loop (opcode 0x{b:02X}, offset {offset})")
+                loop_len = abs(offset)
+                loop_start = max(0, (i + 2) - loop_len)
+                loop_end = i
+                # Enclosed math verification: math instruction must reside inside [loop_start, loop_end]
+                enclosed = [m for m in math_locations if loop_start <= m <= loop_end]
+                if enclosed:
+                    details.append(f"Backward loop (opcode 0x{b:02X}, offset {offset}) encloses math at +{enclosed[0]}")
+                    return True, f"Detected backward loop containing XOR/arithmetic operations [{'; '.join(details)}]"
 
-    if has_xor_or_math and has_backward_jump:
-        detail_str = f" [{', '.join(details)}]" if details else ""
-        return True, f"Detected backward loop containing XOR/arithmetic operations{detail_str}"
-    elif has_backward_jump:
-        return False, "Backward loop found, but no obvious arithmetic/XOR instructions"
-    elif has_xor_or_math:
-        return False, "Arithmetic/XOR operations found, but no tight loop detected"
+    if math_locations:
+        return False, "Arithmetic/XOR operations found, but no enclosing loop detected"
 
     return False, "No decryptor loop patterns identified"
 
@@ -198,9 +211,10 @@ def scan_file(file_path: str):
         return
 
     overall_entropy = calculate_entropy(file_bytes)
-    peak_sliding_entropy, peak_offset = calculate_sliding_window_entropy(file_bytes, window_size=256, step=64)
+    peak_sliding_entropy, peak_offset, first_high_offset = calculate_sliding_window_entropy(
+        file_bytes, window_size=256, step=64
+    )
 
-    # Pass in-memory buffer directly (avoids redundant disk read)
     is_pe, sections, ep_bytes = parse_pe_sections(file_bytes)
 
     # 1. Evaluate Entropy
@@ -208,10 +222,9 @@ def scan_file(file_path: str):
     print(f"    - Overall File Entropy:         {overall_entropy} / 8.0")
     print(f"    - Peak 256-Byte Window Entropy: {peak_sliding_entropy} / 8.0 (Offset: 0x{peak_offset:04X})")
 
-    # Check dilution: For raw files, flag if local window >= 7.18 despite low overall entropy.
-    # For PE files, flag if an executable section has high entropy or if peak >= 7.45
+    # Dilution evaluation: calibrated against random window expectation (~7.28)
     is_diluted = False
-    if not is_pe and overall_entropy < 6.5 and peak_sliding_entropy >= 7.18:
+    if not is_pe and overall_entropy < 6.5 and peak_sliding_entropy >= 7.15:
         is_diluted = True
         print(f"    [!] DILUTION DETECTED: 256-byte window found local encrypted pocket despite low overall entropy!")
     elif is_pe and overall_entropy < 6.5 and peak_sliding_entropy >= 7.45:
@@ -225,7 +238,7 @@ def scan_file(file_path: str):
         print(f"    - Format: Windows PE Executable ({len(sections)} sections)")
         for sec in sections:
             status = "NORMAL"
-            if sec["entropy"] >= 7.18:
+            if sec["entropy"] >= 7.15:
                 status = "HIGH (Encrypted/Compressed)"
                 high_entropy_sections.append(sec["name"])
             if sec["w_and_x"]:
@@ -234,21 +247,22 @@ def scan_file(file_path: str):
             print(f"      * Section '{sec['name']:<8}' | Entropy: {sec['entropy']:<4} | W: {sec['is_writable']} | X: {sec['is_executable']} -> {status}")
     else:
         print(f"    - Format: Raw Binary / Non-PE Data")
-        if peak_sliding_entropy >= 7.18:
+        if peak_sliding_entropy >= 7.15:
             print("    - WARNING: File contains high-entropy payload (likely encrypted).")
 
-    # 2. Evaluate Decryptor Stub (at Entry Point or near high-entropy peak)
+    # 2. Evaluate Decryptor Stub (at Entry Point or at padding transition boundary)
     print(f"\n[2] DECRYPTOR STUB ANALYSIS")
     has_loop, loop_desc = detect_decryption_loop(ep_bytes)
 
-    # If no loop at entry point but a high-entropy pocket exists, scan near peak offset (padding-bypass defense)
-    if not has_loop and peak_offset > 0:
-        check_start = max(0, peak_offset - 64)
+    # Padding-bypass check: For raw non-PE binaries, if no loop at file head,
+    # inspect the boundary immediately preceding the first high-entropy window
+    if not is_pe and not has_loop and first_high_offset > 0:
+        check_start = max(0, first_high_offset - 64)
         check_chunk = file_bytes[check_start : check_start + 256]
         alt_loop, alt_desc = detect_decryption_loop(check_chunk)
         if alt_loop:
             has_loop = True
-            loop_desc = f"{alt_desc} (located near payload offset 0x{peak_offset:04X})"
+            loop_desc = f"{alt_desc} (located at transition boundary 0x{check_start:04X})"
 
     print(f"    - Analysis: {loop_desc}")
 
@@ -259,9 +273,9 @@ def scan_file(file_path: str):
     # Reason 1: High entropy
     has_high_entropy = (
         high_entropy_sections or
-        (not is_pe and peak_sliding_entropy >= 7.18) or
+        (not is_pe and peak_sliding_entropy >= 7.15) or
         (is_pe and peak_sliding_entropy >= 7.45) or
-        overall_entropy >= 7.18
+        overall_entropy >= 7.15
     )
     if has_high_entropy:
         score += 35
@@ -278,7 +292,7 @@ def scan_file(file_path: str):
     # Reason 3: Decryptor loop
     if has_loop:
         score += 35
-        reasons.append("Decryptor stub detected (tight backward loop with XOR/crypto math)")
+        reasons.append("Decryptor stub detected (tight backward loop enclosing arithmetic/crypto math)")
 
     # 4. Final Verdict
     print(f"\n[3] FINAL VERDICT & RISK ASSESSMENT")
@@ -329,11 +343,11 @@ def create_demo_files():
 
     # 3. Diluted polymorphic sample:
     # 5,000 zeroes + the polymorphic payload.
-    # Tests sliding-window entropy and padding-bypass stub detection.
+    # Tests sliding-window entropy and first-high-entropy transition stub detection.
     diluted_data = (b"\x00" * 5000) + mock_poly_data
     with open("sample_diluted.bin", "wb") as f:
         f.write(diluted_data)
-    print("    [+] Created 'sample_diluted.bin' (Padded with 5,000 zeroes to test sliding-window & padding bypass!)\n")
+    print("    [+] Created 'sample_diluted.bin' (Padded with 5,000 zeroes to test transition boundary stub detection!)\n")
 
 
 def main():
